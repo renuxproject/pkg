@@ -177,6 +177,11 @@ static struct config_entry c[] = {
 		"3",
 	},
 	{
+		PKG_INT,
+		"PKG_PARALLEL_JOBS",
+		"4",
+	},
+	{
 		PKG_STRING,
 		"PKG_PLUGINS_DIR",
 		PREFIX"/lib/pkg/",

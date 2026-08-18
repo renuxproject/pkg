@@ -218,6 +218,13 @@ network, either by SSH or any of the protocols supported by
 .Xr fetch 3
 functions.
 Default: 30.
+.It Cm PKG_PARALLEL_JOBS: integer
+Number of packages to download in parallel when installing, upgrading or
+fetching.  Stock pkg downloads packages one at a time; with more than one
+job a few worker processes are forked and each downloads a slice of the
+packages, which speeds up installs on slow links considerably.  Progress
+bars are suppressed while parallel fetching; errors are still reported.
+Default: 4.
 .It Cm HANDLE_RC_SCRIPTS: boolean
 When enabled, this option will automatically perform start/stop of
 services during package installation and deinstallation.

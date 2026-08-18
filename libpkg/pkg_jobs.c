@@ -55,6 +55,8 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <ctype.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 #include "pkg.h"
 #include <xstring.h>
@@ -2265,7 +2267,116 @@ pkg_jobs_apply(struct pkg_jobs *j)
 }
 
 
+/*
+ * Fetch all remote packages in parallel.
+ *
+ * Stock pkg downloads packages one at a time.  Forking a few worker
+ * processes (bounded by PKG_PARALLEL_JOBS) and giving each a slice of the
+ * work speeds up installs a lot on slow links, without having to make the
+ * single shared per-repo fetch handle thread-safe.  Each child sends its
+ * progress to /dev/null so the progress bars never interleave; errors still
+ * go to stderr and the parent reports the overall result.
+ */
 static int
+pkg_jobs_fetch_parallel(struct pkg_jobs *j, bool mirror, const char *cachedir,
+    bool symlink)
+{
+	struct pkg **pkgs;
+	int i, nfetch = 0, workers, errors = 0, status;
+	pid_t pid;
+
+	/* Collect the packages that actually need fetching. */
+	vec_foreach(j->jobs, i) {
+		struct pkg_solved *ps = j->jobs.d[i];
+		if (ps->type == PKG_SOLVED_DELETE || ps->type == PKG_SOLVED_UPGRADE_REMOVE)
+			continue;
+		if (ps->items[0]->pkg->type != PKG_REMOTE)
+			continue;
+		nfetch++;
+	}
+	if (nfetch == 0)
+		return (EPKG_OK);
+
+	pkgs = xcalloc(nfetch, sizeof(*pkgs));
+	nfetch = 0;
+	vec_foreach(j->jobs, i) {
+		struct pkg_solved *ps = j->jobs.d[i];
+		if (ps->type == PKG_SOLVED_DELETE || ps->type == PKG_SOLVED_UPGRADE_REMOVE)
+			continue;
+		if (ps->items[0]->pkg->type != PKG_REMOTE)
+			continue;
+		pkgs[nfetch++] = ps->items[0]->pkg;
+	}
+
+	workers = (int)pkg_object_int(pkg_config_get("PKG_PARALLEL_JOBS"));
+	if (workers < 1)
+		workers = 1;
+	if (workers > nfetch)
+		workers = nfetch;
+
+	if (workers == 1) {
+		for (i = 0; i < nfetch; i++) {
+			int rc = mirror
+			    ? pkg_repo_mirror_package(pkgs[i], cachedir, symlink)
+			    : pkg_repo_fetch_package(pkgs[i]);
+			if (rc != EPKG_OK) {
+				free(pkgs);
+				return (rc);
+			}
+		}
+		free(pkgs);
+		return (EPKG_OK);
+	}
+
+	{
+		char msg[128];
+		snprintf(msg, sizeof(msg),
+		    "Fetching %d packages with %d parallel workers...",
+		    nfetch, workers);
+		pkg_emit_message(msg);
+	}
+
+	/* Make sure no buffered output is duplicated into the children. */
+	fflush(NULL);
+
+	for (i = 0; i < workers; i++) {
+		int start = (i * nfetch) / workers;
+		int end = ((i + 1) * nfetch) / workers;
+
+		pid = fork();
+		if (pid < 0) {
+			pkg_emit_errno("fork", "parallel fetch");
+			errors++;
+			continue;
+		}
+		if (pid == 0) {
+			int k, rc = EPKG_OK, nullfd = open("/dev/null", O_WRONLY);
+
+			if (nullfd >= 0)
+				dup2(nullfd, STDOUT_FILENO);
+			for (k = start; k < end; k++) {
+				rc = mirror
+				    ? pkg_repo_mirror_package(pkgs[k], cachedir, symlink)
+				    : pkg_repo_fetch_package(pkgs[k]);
+				if (rc != EPKG_OK)
+					break;
+			}
+			_exit(rc == EPKG_OK ? 0 : 1);
+		}
+	}
+
+	while (waitpid(-1, &status, 0) > 0) {
+		if (WIFEXITED(status) && WEXITSTATUS(status) != 0)
+			errors++;
+		else if (WIFSIGNALED(status))
+			errors++;
+	}
+
+	free(pkgs);
+	return (errors == 0 ? EPKG_OK : EPKG_FATAL);
+}
+
+int
 pkg_jobs_fetch(struct pkg_jobs *j)
 {
 	struct pkg *p = NULL;
@@ -2336,28 +2447,8 @@ pkg_jobs_fetch(struct pkg_jobs *j)
 	if ((j->flags & PKG_FLAG_DRY_RUN) == PKG_FLAG_DRY_RUN)
 		return (EPKG_OK); /* don't download anything */
 
-	/* Fetch */
-	vec_foreach(j->jobs, i) {
-		struct pkg_solved *ps = j->jobs.d[i];
-		if (ps->type != PKG_SOLVED_DELETE && ps->type != PKG_SOLVED_UPGRADE_REMOVE) {
-			p = ps->items[0]->pkg;
-			if (p->type != PKG_REMOTE)
-				continue;
-
-			if (mirror) {
-				retcode = pkg_repo_mirror_package(p, cachedir, symlink);
-				if (retcode != EPKG_OK)
-					return (retcode);
-			}
-			else {
-				retcode = pkg_repo_fetch_package(p);
-				if (retcode != EPKG_OK)
-					return (retcode);
-			}
-		}
-	}
-
-	return (EPKG_OK);
+	/* Fetch (in parallel when PKG_PARALLEL_JOBS > 1) */
+	return (pkg_jobs_fetch_parallel(j, mirror, cachedir, symlink));
 }
 
 #ifdef HAVE_CHFLAGSAT
