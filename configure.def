@@ -32,6 +32,18 @@ options \
 # Apply command-line arguments now that options are declared
 _configure_apply
 
+# Cross-compilation: the CC knows the real target, while "host" is the build
+# machine (e.g. x86_64-linux when cross-building from Linux).  Override host
+# with the compiler target so the platform branches below (libmd, libbsd,
+# pkgconfigdir, ...) match the OS we are actually building for.
+if is_defined CC && [ -n "$(get_define CC)" ]; then
+	_cc_target=$(eval "$(get_define CC) -dumpmachine" 2>/dev/null || true)
+	if [ -n "$_cc_target" ]; then
+		define host "$_cc_target"
+		msg "Cross target: $_cc_target"
+	fi
+fi
+
 # pkgconfigdir
 _pkgconfigdir=$(opt_str pkgconfigdir) || true
 if [ -n "$_pkgconfigdir" ]; then
@@ -82,15 +94,21 @@ fi
 
 _host=$(get_define host)
 
-# Platform-specific: Linux needs libbsd
+# Platform-specific: Linux needs libbsd for getprogname.  When the target
+# already provides getprogname in libc (e.g. cross-building for FreeBSD
+# from a Linux host) no libbsd is required.
 case "$_host" in
 	*-linux*)
-		cc_with "-libs -lbsd" cc_check_functions getprogname
-		if [ "$(get_define HAVE_GETPROGNAME)" = "1" ]; then
-			define_append EXTRA_LIBS -lbsd
-			define_feature libbsd
+		if cc_check_functions getprogname; then
+			define_feature static
 		else
-			user_error "Unable to find libbsd"
+			cc_with "-libs -lbsd" cc_check_functions getprogname
+			if [ "$(get_define HAVE_GETPROGNAME)" = "1" ]; then
+				define_append EXTRA_LIBS -lbsd
+				define_feature libbsd
+			else
+				user_error "Unable to find libbsd"
+			fi
 		fi
 		;;
 	*)
