@@ -631,6 +631,7 @@ main(int argc, char **argv)
 
 	umask(022);
 	pkg_event_register(&event_callback, &debug);
+	pkg_fetch_render_register(&pkgcli_parallel_fetch_render, NULL);
 
 	/* reset getopt for the next call */
 	optreset = 1;

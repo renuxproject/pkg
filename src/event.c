@@ -42,6 +42,7 @@
 #endif
 #include <sys/wait.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
 
 #include <err.h>
 #include <string.h>
@@ -59,8 +60,6 @@
 #include "pkgcli.h"
 #include "xmalloc.h"
 
-#define STALL_TIME 5
-
 xstring *messages = NULL;
 xstring *conflicts = NULL;
 
@@ -76,21 +75,21 @@ static bool progress_started = false;
 static bool progress_interrupted = false;
 static bool progress_debit = false;
 static int64_t last_tick = 0;
-static int64_t stalled;
-static int64_t bytes_per_second;
-static time_t last_update;
-static time_t begin = 0;
 static int add_deps_depth;
 static vec_t(struct cleanup *) cleanup_list = vec_init();
 static bool signal_handler_installed = false;
 static size_t nbactions = 0;
-static size_t nbdigits = 0;
 static size_t nbdone = 0;
-
-/* units for format_size */
-static const char *unit_SI[] = { " ", "k", "M", "G", "T", };
+static const char *action_verb = NULL;
+static double progress_rate = 0;
+static int64_t progress_last_ms = 0;
+static int64_t progress_last_draw_ms = 0;
 
 static void draw_progressbar(int64_t current, int64_t total);
+static int pkgcli_getcols(void);
+static int64_t pkgcli_now_ms(void);
+static double pkgcli_humanize(int64_t bytes, const char **label);
+static void pkgcli_fill_progress(int percent, int proglen);
 
 static void
 cleanup_handler(int sig)
@@ -113,24 +112,6 @@ cleanup_handler(int sig)
 	_exit(128 + sig);
 }
 
-static void
-format_rate_SI(char *buf, int size, off_t bytes)
-{
-	int i;
-
-	bytes *= 100;
-	for (i = 0; bytes >= 100*1000 && unit_SI[i][0] != 'T'; i++)
-		bytes = (bytes + 500) / 1000;
-	if (i == 0) {
-		i++;
-		bytes = (bytes + 500) / 1000;
-	}
-	snprintf(buf, size, "%3lld.%1lld %sB",
-	    (long long) (bytes + 5) / 100,
-	    (long long) (bytes + 5) / 10 % 10,
-	    unit_SI[i]);
-}
-
 void
 job_status_end(xstring *msg)
 {
@@ -138,20 +119,6 @@ job_status_end(xstring *msg)
 	printf("%s\n", msg->buf);
 	xstring_reset(msg);
 }
-
-static int
-count_digits(int n){
-	if (n == 0)
-		return (1);
-	if (n < 0)
-		n = -n;
-	int c = 0;
-	while (n > 0) {
-		n /= 10; c++;
-	}
-	return (c);
-}
-
 
 void
 job_status_begin(xstring *msg)
@@ -193,9 +160,7 @@ job_status_begin(xstring *msg)
 	}
 
 	if ((nbtodl > 0 || nbactions > 0) && nbdone > 0) {
-		if (nbdigits == 0)
-			nbdigits = count_digits(nbtodl ? nbtodl : nbactions);
-		xstring_printf(msg, "[%*zu/%zu] ", (int)nbdigits, nbdone, (nbtodl) ? nbtodl : nbactions);
+		xstring_printf(msg, "(%zu/%zu) ", nbdone, (nbtodl) ? nbtodl : nbactions);
 	}
 	if (nbtodl > 0 && nbtodl == nbdone) {
 		nbtodl = 0;
@@ -221,16 +186,16 @@ progressbar_start(const char *pmsg)
 	}
 	last_progress_percent = -1;
 	last_tick = 0;
-	begin = last_update = time(NULL);
-	bytes_per_second = 0;
-	stalled = 0;
 
 	progress_started = true;
 	progress_interrupted = false;
+	progress_rate = 0;
+	progress_last_ms = 0;
+	progress_last_draw_ms = 0;
 	if (!isatty(STDOUT_FILENO))
 		printf("%s: ", progress_message);
 	else
-		printf("%s:   0%%", progress_message);
+		draw_progressbar(0, 0);
 }
 
 void
@@ -270,123 +235,380 @@ progressbar_stop(void)
 	last_progress_percent = -1;
 	progress_started = false;
 	progress_interrupted = false;
+	action_verb = NULL;
 }
 
 static void
 draw_progressbar(int64_t current, int64_t total)
 {
-	int percent;
-	int64_t transferred;
-	time_t elapsed = 0, now = 0;
-	char buf[9];
-	int64_t bytes_left;
-	int cur_speed;
-	int hours, minutes, seconds;
-	float age_factor;
+	int percent, cols, infolen, filenamelen, barwidth;
+	int64_t now;
+	double xh, rh;
+	const char *xl, *rl;
+	unsigned int eta_h, eta_m, eta_s;
 
 	if (!progress_started) {
 		progressbar_stop();
 		return;
 	}
 
+	percent = (total > 0) ? (int)((double)current * 100.0 / total) : 0;
+	if (percent > 100)
+		percent = 100;
+
+	cols = pkgcli_getcols();
+	infolen = cols * 6 / 10;
+	if (infolen < 50)
+		infolen = 50;
+
+	now = pkgcli_now_ms();
+
+	/* Redraw on completion, after an interruption, on percent change
+	 * (transactions) or at most every 200ms (downloads). */
+	if (!progress_interrupted && !(total > 0 && current >= total) &&
+	    (progress_debit ? (now - progress_last_draw_ms < 200) :
+	    (percent == last_progress_percent)))
+		return;
+	last_progress_percent = percent;
+	progress_last_draw_ms = now;
+
 	if (progress_debit) {
-		now = time(NULL);
-		elapsed = (now >= last_update) ? now - last_update : 0;
-	}
-
-	percent = (total != 0) ? (current * 100. / total) : 100;
-
-	/**
-	 * Wait for interval for debit bars to keep calc per second.
-	 * If not debit, show on every % change, or if ticking after
-	 * an interruption (which removed our progressbar output).
-	 */
-	if (current >= total || (progress_debit && elapsed >= 1) ||
-	    (!progress_debit &&
-	    (percent != last_progress_percent || progress_interrupted))) {
-		last_progress_percent = percent;
-
-		printf("\r%s: %3d%%", progress_message, percent);
-		if (progress_debit) {
-			transferred = current - last_tick;
+		if (progress_last_ms == 0) {
+			progress_last_ms = now;
 			last_tick = current;
-			bytes_left = total - current;
-			if (bytes_left <= 0) {
-				elapsed = now - begin;
-				/* Always show at least 1 second at end. */
-				if (elapsed == 0)
-					elapsed = 1;
-				/* Calculate true total speed when done */
-				transferred = total;
-				bytes_per_second = 0;
-			}
-
-			if (elapsed != 0)
-				cur_speed = (transferred / elapsed);
-			else
-				cur_speed = transferred;
-
-#define AGE_FACTOR_SLOW_START 3
-			if (now - begin <= AGE_FACTOR_SLOW_START)
-				age_factor = 0.4;
-			else
-				age_factor = 0.9;
-
-			if (bytes_per_second != 0) {
-				bytes_per_second =
-				    (bytes_per_second * age_factor) +
-				    (cur_speed * (1.0 - age_factor));
-			} else
-				bytes_per_second = cur_speed;
-
-			humanize_number(buf, sizeof(buf),
-			    current,"B", HN_AUTOSCALE, HN_IEC_PREFIXES);
-			printf(" %*s", (int)sizeof(buf), buf);
-
-			if (bytes_left > 0)
-				format_rate_SI(buf, sizeof(buf), transferred);
-			else /* Show overall speed when done */
-				format_rate_SI(buf, sizeof(buf),
-				    bytes_per_second);
-			printf(" %s/s ", buf);
-
-			if (!transferred)
-				stalled += elapsed;
-			else
-				stalled = 0;
-
-			if (stalled >= STALL_TIME)
-				printf(" - stalled -");
-			else if (bytes_per_second == 0 && bytes_left > 0)
-				printf("   --:-- ETA");
-			else {
-				if (bytes_left > 0)
-					seconds = bytes_left / bytes_per_second;
-				else
-					seconds = elapsed;
-
-				hours = seconds / 3600;
-				seconds -= hours * 3600;
-				minutes = seconds / 60;
-				seconds -= minutes * 60;
-
-				if (hours != 0)
-					printf("%02d:%02d:%02d", hours,
-					    minutes, seconds);
-				else
-					printf("   %02d:%02d", minutes, seconds);
-
-				if (bytes_left > 0)
-					printf(" ETA");
-				else
-					printf("    ");
-			}
-			last_update = now;
+		} else if (now > progress_last_ms) {
+			progress_rate = (double)(current - last_tick) /
+			    (double)(now - progress_last_ms) * 1000.0;
+			last_tick = current;
+			progress_last_ms = now;
 		}
-		fflush(stdout);
+
+		filenamelen = infolen - 30;
+		barwidth = cols - infolen;
+
+		printf("\r %-*s ", filenamelen, progress_message);
+
+		xh = pkgcli_humanize(current, &xl);
+		printf("%6.1f %3s  ", xh, xl);
+
+		rh = pkgcli_humanize((int64_t)progress_rate, &rl);
+		if (rh < 9.995)
+			printf("%4.2f %3s/s ", rh, rl);
+		else if (rh < 99.95)
+			printf("%4.1f %3s/s ", rh, rl);
+		else
+			printf("%4.0f %3s/s ", rh, rl);
+
+		if (total > 0 && progress_rate > 0) {
+			eta_s = (unsigned int)((total - current) / progress_rate);
+			eta_h = eta_s / 3600;
+			eta_s -= eta_h * 3600;
+			eta_m = eta_s / 60;
+			eta_s -= eta_m * 60;
+			if (eta_h == 0)
+				printf("%02u:%02u", eta_m, eta_s);
+			else if (eta_h == 1 && eta_m < 40)
+				printf("%02u:%02u", eta_m + 60, eta_s);
+			else
+				fputs("--:--", stdout);
+		} else {
+			fputs("--:--", stdout);
+		}
+
+		pkgcli_fill_progress(percent, barwidth);
+	} else {
+		barwidth = cols - infolen - 1;
+		printf("\r%-*s ", infolen, progress_message);
+		pkgcli_fill_progress(percent, barwidth);
 	}
-	if (current >= total)
+	printf("\033[K");
+	fflush(stdout);
+
+	if (total > 0 && current >= total)
 		progressbar_stop();
+}
+
+/* -------------------------------------------------------------------------
+ * Parallel fetch progress, pacman style.
+ *
+ * The workers behind PKG_PARALLEL_JOBS report their progress through a
+ * pipe (see pkg_parallel_fetch_child_init() in libpkg).  This renderer runs
+ * in the parent, reads those records and draws one permanent line per
+ * package, updated in place, exactly like pacman's download display.
+ * ------------------------------------------------------------------------- */
+
+struct pkgcli_dl {
+	char *name;
+	int64_t current;
+	int64_t total;
+	int64_t last_current;
+	double rate;
+	int64_t last_time;
+	bool started;
+	bool done;
+};
+
+static int64_t
+pkgcli_now_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ((int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+}
+
+/* Terminal width in columns (falling back to $COLUMNS or 80). */
+static int
+pkgcli_getcols(void)
+{
+	struct winsize ws;
+	const char *env;
+	char *end;
+	long n;
+
+	if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
+		return ((int)ws.ws_col);
+	if ((env = getenv("COLUMNS")) != NULL) {
+		n = strtol(env, &end, 10);
+		if (*end == '\0' && n > 0 && n < 10000)
+			return ((int)n);
+	}
+	return (80);
+}
+
+/* Humanize a byte count like pacman's humanize_size() (base 1024). */
+static double
+pkgcli_humanize(int64_t bytes, const char **label)
+{
+	static const char *units[] = { "B", "KiB", "MiB", "GiB", "TiB", "PiB" };
+	double v = (double)bytes;
+	int i = 0;
+
+	while (v >= 1024.0 && i < (int)NELEM(units) - 1) {
+		v /= 1024.0;
+		i++;
+	}
+	*label = units[i];
+	return (v);
+}
+
+/* Draw the [####----] NNN% tail of a line, filling `proglen` columns. */
+static void
+pkgcli_fill_progress(int percent, int proglen)
+{
+	const int hashlen = proglen > 8 ? proglen - 8 : 0;
+	const int hash = percent * hashlen / 100;
+	int i;
+
+	if (hashlen > 0) {
+		fputs(" [", stdout);
+		for (i = hashlen; i > 0; --i)
+			putchar(i > hashlen - hash ? '#' : '-');
+		putchar(']');
+	}
+	if (proglen >= 5)
+		printf(" %3d%%", percent);
+}
+
+static void
+pkgcli_dl_draw(struct pkgcli_dl *dl, int filenamelen, int barwidth)
+{
+	double xh, rh;
+	const char *xl, *rl;
+	unsigned int eta_h, eta_m, eta_s;
+	int percent;
+
+	percent = (dl->total > 0) ?
+	    (int)((double)dl->current * 100.0 / dl->total) : 0;
+	if (percent > 100)
+		percent = 100;
+
+	if (dl->total > 0 && dl->rate > 0) {
+		eta_s = (unsigned int)((dl->total - dl->current) / dl->rate);
+		eta_h = eta_s / 3600;
+		eta_s -= eta_h * 3600;
+		eta_m = eta_s / 60;
+		eta_s -= eta_m * 60;
+	} else {
+		eta_h = eta_m = eta_s = 0;
+	}
+
+	printf(" %-*s ", filenamelen, dl->name);
+
+	xh = pkgcli_humanize(dl->current, &xl);
+	printf("%6.1f %3s  ", xh, xl);
+
+	rh = pkgcli_humanize((int64_t)dl->rate, &rl);
+	if (rh < 9.995)
+		printf("%4.2f %3s/s ", rh, rl);
+	else if (rh < 99.95)
+		printf("%4.1f %3s/s ", rh, rl);
+	else
+		printf("%4.0f %3s/s ", rh, rl);
+
+	if (dl->total > 0 && dl->rate > 0) {
+		if (eta_h == 0)
+			printf("%02u:%02u", eta_m, eta_s);
+		else if (eta_h == 1 && eta_m < 40)
+			printf("%02u:%02u", eta_m + 60, eta_s);
+		else
+			fputs("--:--", stdout);
+	} else {
+		fputs("--:--", stdout);
+	}
+
+	pkgcli_fill_progress(percent, barwidth);
+}
+
+static void
+pkgcli_dl_redraw(struct pkgcli_dl *slots, int nslots, int *lines_drawn)
+{
+	int64_t now = pkgcli_now_ms();
+	int cols = pkgcli_getcols();
+	int infolen = cols * 6 / 10;
+	int filenamelen, barwidth;
+	int ndrawn = 0, last = -1, i;
+
+	if (infolen < 50)
+		infolen = 50;
+	filenamelen = infolen - 30;
+	barwidth = cols - infolen;
+
+	for (i = 0; i < nslots; i++)
+		if (slots[i].started) {
+			ndrawn++;
+			last = i;
+		}
+	if (ndrawn == 0)
+		return;
+
+	if (*lines_drawn > 0)
+		printf("\033[%dA", *lines_drawn);
+
+	for (i = 0; i < nslots; i++) {
+		struct pkgcli_dl *dl = &slots[i];
+
+		if (!dl->started)
+			continue;
+
+		if (dl->last_time == 0) {
+			dl->last_time = now;
+			dl->last_current = dl->current;
+		} else if (now > dl->last_time) {
+			dl->rate = (double)(dl->current - dl->last_current) /
+			    (double)(now - dl->last_time) * 1000.0;
+			dl->last_current = dl->current;
+			dl->last_time = now;
+		}
+
+		pkgcli_dl_draw(dl, filenamelen, barwidth);
+		printf("\033[K");
+		if (i != last)
+			printf("\n");
+	}
+	fflush(stdout);
+	*lines_drawn = ndrawn;
+}
+
+int
+pkgcli_parallel_fetch_render(int fd, int nslots, void *data __unused)
+{
+	struct pkgcli_dl *slots;
+	FILE *fp;
+	char *line = NULL, *p;
+	size_t cap = 0;
+	ssize_t len;
+	int lines_drawn = 0;
+	int64_t last_redraw = 0;
+	bool tty = isatty(STDOUT_FILENO) != 0;
+	int i;
+
+	slots = xcalloc(nslots, sizeof(*slots));
+
+	fp = fdopen(fd, "r");
+	if (fp == NULL) {
+		/* Extremely unlikely; at least make sure the workers never
+		 * block on a full pipe. */
+		char buf[4096];
+		while (read(fd, buf, sizeof(buf)) > 0)
+			;
+		free(slots);
+		return (EPKG_FATAL);
+	}
+
+	while ((len = getline(&line, &cap, fp)) != -1) {
+		int slot;
+
+		if (len < 3 || line[1] != ' ')
+			continue;
+		slot = atoi(line + 2);
+		if (slot < 0 || slot >= nslots)
+			continue;
+		switch (line[0]) {
+		case 'B':
+			p = strchr(line + 2, ' ');
+			if (p == NULL)
+				break;
+			p++;
+			p[strcspn(p, "\r\n")] = '\0';
+			free(slots[slot].name);
+			slots[slot].name = xstrdup(p);
+			slots[slot].current = 0;
+			slots[slot].total = 0;
+			slots[slot].last_current = 0;
+			slots[slot].last_time = 0;
+			slots[slot].rate = 0.0;
+			slots[slot].started = true;
+			slots[slot].done = false;
+			if (tty && !quiet)
+				pkgcli_dl_redraw(slots, nslots, &lines_drawn);
+			break;
+		case 'T':
+			p = strchr(line + 2, ' ');
+			slots[slot].current = (p != NULL) ? strtoll(p + 1, NULL, 10) : 0;
+			p = (p != NULL) ? strchr(p + 1, ' ') : NULL;
+			slots[slot].total = (p != NULL) ? strtoll(p + 1, NULL, 10) : 0;
+			if (tty && !quiet &&
+			    (pkgcli_now_ms() - last_redraw >= 100 ||
+			    slots[slot].current >= slots[slot].total)) {
+				last_redraw = pkgcli_now_ms();
+				pkgcli_dl_redraw(slots, nslots, &lines_drawn);
+			}
+			break;
+		case 'E':
+			slots[slot].done = true;
+			if (!tty && !quiet)
+				printf(" %s\n", slots[slot].name != NULL ?
+				    slots[slot].name : "unknown");
+			else if (tty && !quiet)
+				pkgcli_dl_redraw(slots, nslots, &lines_drawn);
+			break;
+		}
+	}
+
+	/* Finish whatever is still on screen. */
+	if (tty && !quiet && lines_drawn > 0)
+		printf("\n");
+	else if (!tty && !quiet) {
+		/* Report any package that never got a completion record (its
+		 * worker failed partway through). */
+		for (i = 0; i < nslots; i++)
+			if (slots[i].started && !slots[i].done && slots[i].name != NULL)
+				printf(" %s (failed)\n", slots[i].name);
+	}
+
+	/* The parallel fetch already accounted for the downloads, so the
+	 * following install/upgrade steps restart their counters. */
+	nbtodl = 0;
+	nbdone = 0;
+
+	free(line);
+	for (i = 0; i < nslots; i++)
+		free(slots[i].name);
+	free(slots);
+	fclose(fp);
+
+	return (EPKG_OK);
 }
 
 static const char *
@@ -432,7 +654,7 @@ event_cb_developer_mode(struct pkg_event *ev, int *debug __unused)
 static int
 event_cb_update_add(struct pkg_event *ev, int *debug __unused)
 {
-	if (quiet || !isatty(STDOUT_FILENO))
+	if (quiet || updating_catalogues || !isatty(STDOUT_FILENO))
 		return (0);
 	printf("\rPushing new entries %d/%d", ev->e_upd_add.done, ev->e_upd_add.total);
 	if (ev->e_upd_add.total == ev->e_upd_add.done)
@@ -443,7 +665,7 @@ event_cb_update_add(struct pkg_event *ev, int *debug __unused)
 static int
 event_cb_update_remove(struct pkg_event *ev, int *debug __unused)
 {
-	if (quiet || !isatty(STDOUT_FILENO))
+	if (quiet || updating_catalogues || !isatty(STDOUT_FILENO))
 		return (0);
 	printf("\rRemoving entries %d/%d", ev->e_upd_remove.done, ev->e_upd_remove.total);
 	if (ev->e_upd_remove.total == ev->e_upd_remove.done)
@@ -458,7 +680,7 @@ event_cb_fetch_begin(struct pkg_event *ev, int *debug __unused)
 
 	if (nbtodl > 0)
 		nbdone++;
-	if (quiet)
+	if (quiet || updating_catalogues)
 		return (0);
 	filename = strrchr(ev->e_fetching.url, '/');
 	if (filename != NULL) {
@@ -496,19 +718,11 @@ event_cb_fetch_finished(struct pkg_event *ev __unused, int *debug __unused)
 }
 
 static int
-event_cb_install_begin(struct pkg_event *ev, int *debug __unused)
+event_cb_install_begin(struct pkg_event *ev __unused, int *debug __unused)
 {
-	struct pkg *pkg;
-
 	if (quiet)
 		return (0);
-	job_status_begin(msg_buf);
-
-	pkg = ev->e_install_begin.pkg;
-	pkg_fprintf(msg_buf->fp, "Installing %n-%v...\n", pkg,
-	    pkg);
-	xstring_flush(msg_buf);
-	printf("%s", msg_buf->buf);
+	action_verb = "installing";
 	return (0);
 }
 
@@ -521,7 +735,12 @@ event_cb_extract_begin(struct pkg_event *ev, int *debug __unused)
 		return (0);
 	job_status_begin(msg_buf);
 	pkg = ev->e_install_begin.pkg;
-	pkg_fprintf(msg_buf->fp, "Extracting %n-%v", pkg, pkg);
+	if (action_verb != NULL) {
+		fputs(action_verb, msg_buf->fp);
+		fputc(' ', msg_buf->fp);
+		pkg_fprintf(msg_buf->fp, "%n", pkg);
+	} else
+		pkg_fprintf(msg_buf->fp, "Extracting %n-%v", pkg, pkg);
 	xstring_flush(msg_buf);
 	return (0);
 }
@@ -588,19 +807,11 @@ event_cb_integritycheck_conflict(struct pkg_event *ev, int *debug)
 }
 
 static int
-event_cb_deinstall_begin(struct pkg_event *ev, int *debug __unused)
+event_cb_deinstall_begin(struct pkg_event *ev __unused, int *debug __unused)
 {
-	struct pkg *pkg;
-
 	if (quiet)
 		return (0);
-
-	job_status_begin(msg_buf);
-
-	pkg = ev->e_install_begin.pkg;
-	pkg_fprintf(msg_buf->fp, "Deinstalling %n-%v...\n", pkg, pkg);
-	xstring_flush(msg_buf);
-	printf("%s", msg_buf->buf);
+	action_verb = "removing";
 	return (0);
 }
 
@@ -613,8 +824,13 @@ event_cb_delete_files_begin(struct pkg_event *ev, int *debug __unused)
 		return (0);
 	job_status_begin(msg_buf);
 	pkg = ev->e_install_begin.pkg;
-	pkg_fprintf(msg_buf->fp, "Deleting files for %n-%v",
-	    pkg, pkg);
+	if (action_verb != NULL) {
+		fputs(action_verb, msg_buf->fp);
+		fputc(' ', msg_buf->fp);
+		pkg_fprintf(msg_buf->fp, "%n", pkg);
+	} else
+		pkg_fprintf(msg_buf->fp, "Deleting files for %n-%v",
+		    pkg, pkg);
 	return (0);
 }
 
@@ -628,24 +844,17 @@ event_cb_upgrade_begin(struct pkg_event *ev, int *debug __unused)
 	pkg_new = ev->e_upgrade_begin.n;
 	pkg_old = ev->e_upgrade_begin.o;
 
-	job_status_begin(msg_buf);
-
 	switch (pkg_version_change_between(pkg_new, pkg_old)) {
 	case PKG_DOWNGRADE:
-		pkg_fprintf(msg_buf->fp, "Downgrading %n from %v to %v...\n",
-		    pkg_new, pkg_old, pkg_new);
+		action_verb = "downgrading";
 		break;
 	case PKG_REINSTALL:
-		pkg_fprintf(msg_buf->fp, "Reinstalling %n-%v...\n",
-	    pkg_old, pkg_old);
+		action_verb = "reinstalling";
 		break;
 	case PKG_UPGRADE:
-		pkg_fprintf(msg_buf->fp, "Upgrading %n from %v to %v...\n",
-		    pkg_new, pkg_old, pkg_new);
+		action_verb = "upgrading";
 		break;
 	}
-	xstring_flush(msg_buf);
-	printf("%s", msg_buf->buf);
 	return (0);
 }
 
@@ -862,6 +1071,8 @@ event_cb_sandbox_get_string(struct pkg_event *ev, int *debug __unused)
 static int
 event_cb_progress_start(struct pkg_event *ev, int *debug __unused)
 {
+	if (updating_catalogues)
+		return (0);
 	progressbar_start(ev->e_progress_start.msg);
 	return (0);
 }
@@ -892,7 +1103,6 @@ static int
 event_cb_new_action(struct pkg_event *ev, int *debug __unused)
 {
 	nbactions = ev->e_action.total;
-	nbdigits = 0;
 	nbdone = ev->e_action.current;
 	return (0);
 }

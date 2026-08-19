@@ -2273,9 +2273,10 @@ pkg_jobs_apply(struct pkg_jobs *j)
  * Stock pkg downloads packages one at a time.  Forking a few worker
  * processes (bounded by PKG_PARALLEL_JOBS) and giving each a slice of the
  * work speeds up installs a lot on slow links, without having to make the
- * single shared per-repo fetch handle thread-safe.  Each child sends its
- * progress to /dev/null so the progress bars never interleave; errors still
- * go to stderr and the parent reports the overall result.
+ * single shared per-repo fetch handle thread-safe.  Workers keep their
+ * progress bars off stdout (errors still go to stderr) and instead report
+ * their progress through a pipe to the parent, which renders pacman-style
+ * per-package progress lines without ever interleaving them.
  */
 static int
 pkg_jobs_fetch_parallel(struct pkg_jobs *j, bool mirror, const char *cachedir,
@@ -2329,15 +2330,18 @@ pkg_jobs_fetch_parallel(struct pkg_jobs *j, bool mirror, const char *cachedir,
 	}
 
 	{
-		char msg[128];
-		snprintf(msg, sizeof(msg),
-		    "Fetching %d packages with %d parallel workers...",
-		    nfetch, workers);
-		pkg_emit_message(msg);
+		pkg_emit_notice(":: Retrieving packages...");
 	}
 
 	/* Make sure no buffered output is duplicated into the children. */
 	fflush(NULL);
+
+	int pfd[2];
+	if (pipe(pfd) == -1) {
+		pkg_emit_errno("pipe", "parallel fetch");
+		free(pkgs);
+		return (EPKG_FATAL);
+	}
 
 	for (i = 0; i < workers; i++) {
 		int start = (i * nfetch) / workers;
@@ -2350,11 +2354,14 @@ pkg_jobs_fetch_parallel(struct pkg_jobs *j, bool mirror, const char *cachedir,
 			continue;
 		}
 		if (pid == 0) {
-			int k, rc = EPKG_OK, nullfd = open("/dev/null", O_WRONLY);
+			int k, rc = EPKG_OK, nullfd;
 
+			close(pfd[0]);
+			nullfd = open("/dev/null", O_WRONLY);
 			if (nullfd >= 0)
 				dup2(nullfd, STDOUT_FILENO);
 			for (k = start; k < end; k++) {
+				pkg_parallel_fetch_child_init(k, pfd[1]);
 				rc = mirror
 				    ? pkg_repo_mirror_package(pkgs[k], cachedir, symlink)
 				    : pkg_repo_fetch_package(pkgs[k]);
@@ -2364,6 +2371,14 @@ pkg_jobs_fetch_parallel(struct pkg_jobs *j, bool mirror, const char *cachedir,
 			_exit(rc == EPKG_OK ? 0 : 1);
 		}
 	}
+
+	/* The parent only reads; closing the write end lets us hit EOF as soon
+	 * as every worker has exited. */
+	close(pfd[1]);
+
+	/* Drain the pipe and render the pacman-style progress lines. */
+	pkg_fetch_render(pfd[0], nfetch);
+	close(pfd[0]);
 
 	while (waitpid(-1, &status, 0) > 0) {
 		if (WIFEXITED(status) && WEXITSTATUS(status) != 0)

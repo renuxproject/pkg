@@ -160,4 +160,23 @@ void pkg_emit_dir_meta_mismatch(struct pkg *pkg, struct pkg_dir *dir,
 void pkg_emit_file_meta_ok(struct pkg *pkg, struct pkg_file *file);
 void pkg_emit_dir_meta_ok(struct pkg *pkg, struct pkg_dir *file);
 
+/*
+ * Parallel fetch progress reporting.
+ *
+ * When several packages are downloaded at once (PKG_PARALLEL_JOBS > 1) the
+ * fetch is spread over forked worker processes.  Each worker reports its
+ * progress through a pipe using a small line based protocol:
+ *
+ *   B <slot> <name>\n       begin downloading (slot = worker index)
+ *   T <slot> <cur> <tot>\n  progress tick
+ *   E <slot>\n              download finished
+ *
+ * The worker side is enabled with pkg_parallel_fetch_child_init() and the
+ * records are written by the pkg_emit_* fetch helpers.  The parent reads
+ * the pipe and hands it to the renderer registered with
+ * pkg_fetch_render_register() so it can draw pacman-style per-package
+ * progress lines without the workers ever interleaving their output.
+ */
+void pkg_parallel_fetch_child_init(int slot, int fd);
+
 #endif

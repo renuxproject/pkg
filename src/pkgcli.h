@@ -284,6 +284,7 @@ void job_status_begin(xstring *);
 void job_status_end(xstring *);
 
 int event_callback(void *data, struct pkg_event *ev);
+int pkgcli_parallel_fetch_render(int fd, int nslots, void *data);
 int print_pkg(struct pkg *p, void *ctx);
 void print_repository(struct pkg_repo *repo, bool pad);
 void pkgcli_autoremove(struct pkgdb *db, bool flag);
@@ -317,6 +318,7 @@ extern bool auto_update;
 extern int force;
 extern bool quiet;
 extern bool newpkgversion;
+extern bool updating_catalogues;
 void set_globals(void);
 
 #endif

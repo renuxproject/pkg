@@ -72,6 +72,10 @@ pkgcli_update(bool force, bool strict, c_charv_t *reponames)
 		return (EPKG_FATAL);
 	}
 
+	if (!quiet)
+		printf(":: Synchronizing package databases...\n");
+	updating_catalogues = true;
+
 	while (pkg_repos(&r) == EPKG_OK) {
 		if (reponames->len > 0 ) {
 			if (!_find_repo(reponames, pkg_repo_name(r)))
@@ -82,7 +86,7 @@ pkgcli_update(bool force, bool strict, c_charv_t *reponames)
 		}
 
 		if (!quiet)
-			printf("Updating %s repository catalogue...\n",
+			printf(" %s downloading...\n",
 			    pkg_repo_name(r));
 
 		retcode = pkg_update(r, force);
@@ -90,7 +94,7 @@ pkgcli_update(bool force, bool strict, c_charv_t *reponames)
 		if (retcode == EPKG_UPTODATE) {
 			retcode = EPKG_OK;
 			if (!quiet) {
-				printf("%s repository is up to date.\n",
+				printf(" %s is up to date\n",
 				    pkg_repo_name(r));
 			}
 		}
@@ -103,6 +107,7 @@ pkgcli_update(bool force, bool strict, c_charv_t *reponames)
 
 		total_count ++;
 	}
+	updating_catalogues = false;
 
 	/* Warn about requested repos that don't exist */
 	if (reponames->len > 0) {
@@ -127,25 +132,9 @@ pkgcli_update(bool force, bool strict, c_charv_t *reponames)
 			printf("No repositories are enabled.\n");
 		}
 	}
-	else if (update_count == total_count) {
+	else if (update_count != total_count) {
 		if (!quiet) {
-			if (reponames == NULL || reponames->len == 0)
-				printf("All repositories are up to date.\n");
-			else {
-				vec_foreach(*reponames, i)
-					printf("%s%s", i == 0 ? "" : ", ", reponames->d[i]);
-				printf(" %s up to date.\n", reponames->len == 1 ? "is" : "are");
-			}
-		}
-	}
-	else if (total_count == 1) {
-		if (!quiet) {
-			printf("Error updating repositories!\n");
-		}
-	}
-	else {
-		if (!quiet) {
-			printf("Error updating repositories!\n");
+			fprintf(stderr, "Error updating repositories!\n");
 		}
 		if (strict) {
 			retcode = EPKG_FATAL;

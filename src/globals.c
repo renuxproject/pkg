@@ -31,6 +31,7 @@ bool auto_update; /* Do not update repo */
 int force; /* Forced operation */
 bool quiet; /* Silent output */
 bool newpkgversion; /* New package version is available */
+bool updating_catalogues; /* Repository catalogues are being refreshed */
 int nbtodl;
 
 void
@@ -43,6 +44,7 @@ set_globals(void)
 	force = 0;
 	quiet = 0;
 	newpkgversion = 0;
+	updating_catalogues = 0;
 	nbtodl = 0;
 }
 

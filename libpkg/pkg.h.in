@@ -1605,6 +1605,24 @@ typedef int(*pkg_event_cb)(void *, struct pkg_event *);
 void pkg_event_register(pkg_event_cb cb, void *data);
 const char *pkg_meta_attribute_tostring(enum pkg_meta_attribute);
 
+/**
+ * Parallel fetch progress rendering.
+ *
+ * When packages are downloaded with more than one worker
+ * (PKG_PARALLEL_JOBS > 1) the fetching is done by forked workers that
+ * report their progress through a pipe.  libpkg passes the pipe to the
+ * renderer registered here so the CLI can draw pacman-style per-package
+ * progress lines.  If no renderer is registered the pipe is drained
+ * silently so the workers can never block on it.
+ *
+ * The callback receives the read end of the pipe and the number of slots
+ * (workers); it must read until EOF and return EPKG_OK.
+ */
+typedef int (*pkg_fetch_render_cb)(int fd, int nslots, void *data);
+
+void pkg_fetch_render_register(pkg_fetch_render_cb cb, void *data);
+int pkg_fetch_render(int fd, int nslots);
+
 bool pkg_compiled_for_same_os_major(void);
 int pkg_ini(const char *, const char *, pkg_init_flags);
 int pkg_init(const char *, const char *);

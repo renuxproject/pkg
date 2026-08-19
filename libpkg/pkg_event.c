@@ -31,8 +31,10 @@
  */
 
 #include <errno.h>
+#include <stdio.h>
 #include <string.h>
 #include <syslog.h>
+#include <unistd.h>
 #include <xstring.h>
 
 #include "pkg.h"
@@ -41,6 +43,12 @@
 
 static pkg_event_cb _cb = NULL;
 static void *_data = NULL;
+
+static pkg_fetch_render_cb _fetch_render_cb = NULL;
+static void *_fetch_render_data = NULL;
+
+static int parallel_fetch_fd = -1;
+static int parallel_fetch_slot = -1;
 
 static void
 pipe_errno(struct pkg_event *ev, xstring *msg)
@@ -584,6 +592,37 @@ pkg_event_register(pkg_event_cb cb, void *data)
 	_data = data;
 }
 
+void
+pkg_fetch_render_register(pkg_fetch_render_cb cb, void *data)
+{
+	_fetch_render_cb = cb;
+	_fetch_render_data = data;
+}
+
+int
+pkg_fetch_render(int fd, int nslots)
+{
+	char buf[4096];
+
+	if (_fetch_render_cb != NULL)
+		return (_fetch_render_cb(fd, nslots, _fetch_render_data));
+
+	/*
+	 * No renderer registered (plain library user): drain the pipe so the
+	 * worker processes can never block on a full pipe.
+	 */
+	while (read(fd, buf, sizeof(buf)) > 0)
+		;
+	return (EPKG_OK);
+}
+
+void
+pkg_parallel_fetch_child_init(int slot, int fd)
+{
+	parallel_fetch_slot = slot;
+	parallel_fetch_fd = fd;
+}
+
 static int
 pkg_emit_event(struct pkg_event *ev)
 {
@@ -696,6 +735,9 @@ pkg_emit_fetch_finished(const char *url)
 {
 	struct pkg_event ev;
 
+	if (parallel_fetch_fd >= 0)
+		dprintf(parallel_fetch_fd, "E %d\n", parallel_fetch_slot);
+
 	ev.type = PKG_EVENT_FETCH_FINISHED;
 	ev.e_fetching.url = url;
 
@@ -706,6 +748,10 @@ void
 pkg_emit_pkg_fetch_begin(struct pkg *p)
 {
 	struct pkg_event ev;
+
+	if (parallel_fetch_fd >= 0)
+		dprintf(parallel_fetch_fd, "B %d %s-%s\n", parallel_fetch_slot,
+		    p->name, p->version);
 
 	ev.type = PKG_EVENT_PKG_FETCH_BEGIN;
 	ev.e_pkg_fetching.pkg = p;
@@ -1343,6 +1389,10 @@ int
 pkg_emit_progress_tick(int64_t current, int64_t total)
 {
 	struct pkg_event ev;
+
+	if (parallel_fetch_fd >= 0)
+		dprintf(parallel_fetch_fd, "T %d %jd %jd\n", parallel_fetch_slot,
+		    (intmax_t)current, (intmax_t)total);
 
 	ev.type = PKG_EVENT_PROGRESS_TICK;
 	ev.e_progress_tick.current = current;
