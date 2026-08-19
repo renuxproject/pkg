@@ -160,9 +160,9 @@ job_status_begin(xstring *msg)
 	}
 
 	if ((nbtodl > 0 || nbactions > 0) && nbdone > 0) {
-		xstring_printf(msg, "(%zu/%zu) ", nbdone, (nbtodl) ? nbtodl : nbactions);
+		xstring_printf(msg, "(%zu/%zu) ", nbdone, (nbtodl) ? (size_t)nbtodl : nbactions);
 	}
-	if (nbtodl > 0 && nbtodl == nbdone) {
+	if (nbtodl > 0 && (size_t)nbtodl == nbdone) {
 		nbtodl = 0;
 		nbdone = 0;
 	}
@@ -284,7 +284,7 @@ draw_progressbar(int64_t current, int64_t total)
 		}
 
 		filenamelen = infolen - 30;
-		barwidth = cols - infolen;
+		barwidth = cols - infolen - 1;
 
 		printf("\r %-*s ", filenamelen, progress_message);
 
@@ -317,7 +317,7 @@ draw_progressbar(int64_t current, int64_t total)
 
 		pkgcli_fill_progress(percent, barwidth);
 	} else {
-		barwidth = cols - infolen - 1;
+		barwidth = cols - infolen - 2;
 		printf("\r%-*s ", infolen, progress_message);
 		pkgcli_fill_progress(percent, barwidth);
 	}
@@ -433,7 +433,7 @@ pkgcli_dl_draw(struct pkgcli_dl *dl, int filenamelen, int barwidth)
 		eta_h = eta_m = eta_s = 0;
 	}
 
-	printf(" %-*s ", filenamelen, dl->name);
+	printf("\r %-*s ", filenamelen, dl->name);
 
 	xh = pkgcli_humanize(dl->current, &xl);
 	printf("%6.1f %3s  ", xh, xl);
@@ -467,12 +467,12 @@ pkgcli_dl_redraw(struct pkgcli_dl *slots, int nslots, int *lines_drawn)
 	int cols = pkgcli_getcols();
 	int infolen = cols * 6 / 10;
 	int filenamelen, barwidth;
-	int ndrawn = 0, last = -1, i;
+	int ndrawn = 0, last = -1, i, pass;
 
 	if (infolen < 50)
 		infolen = 50;
 	filenamelen = infolen - 30;
-	barwidth = cols - infolen;
+	barwidth = cols - infolen - 1;
 
 	for (i = 0; i < nslots; i++)
 		if (slots[i].started) {
@@ -482,29 +482,38 @@ pkgcli_dl_redraw(struct pkgcli_dl *slots, int nslots, int *lines_drawn)
 	if (ndrawn == 0)
 		return;
 
-	if (*lines_drawn > 0)
-		printf("\033[%dA", *lines_drawn);
+	/* Move up to the top of the previously drawn block.  The cursor sits
+	 * on the last drawn line, so it is `lines_drawn - 1` rows above the
+	 * block start; moving up `lines_drawn` rows would leave a ghost line
+	 * behind on every redraw. */
+	if (*lines_drawn > 1)
+		printf("\033[%dA", *lines_drawn - 1);
 
-	for (i = 0; i < nslots; i++) {
-		struct pkgcli_dl *dl = &slots[i];
+	/* Completed downloads first, so they accumulate at the top of the
+	 * block like pacman; the still-running ones stay at the bottom and
+	 * never get mixed in with the finished lines. */
+	for (pass = 0; pass < 2; pass++) {
+		for (i = 0; i < nslots; i++) {
+			struct pkgcli_dl *dl = &slots[i];
 
-		if (!dl->started)
-			continue;
+			if (!dl->started || dl->done != (pass == 0))
+				continue;
 
-		if (dl->last_time == 0) {
-			dl->last_time = now;
-			dl->last_current = dl->current;
-		} else if (now > dl->last_time) {
-			dl->rate = (double)(dl->current - dl->last_current) /
-			    (double)(now - dl->last_time) * 1000.0;
-			dl->last_current = dl->current;
-			dl->last_time = now;
+			if (dl->last_time == 0) {
+				dl->last_time = now;
+				dl->last_current = dl->current;
+			} else if (now > dl->last_time) {
+				dl->rate = (double)(dl->current - dl->last_current) /
+				    (double)(now - dl->last_time) * 1000.0;
+				dl->last_current = dl->current;
+				dl->last_time = now;
+			}
+
+			pkgcli_dl_draw(dl, filenamelen, barwidth);
+			printf("\033[K");
+			if (i != last)
+				printf("\n");
 		}
-
-		pkgcli_dl_draw(dl, filenamelen, barwidth);
-		printf("\033[K");
-		if (i != last)
-			printf("\n");
 	}
 	fflush(stdout);
 	*lines_drawn = ndrawn;
